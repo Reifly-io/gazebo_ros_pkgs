@@ -96,6 +96,9 @@ public:
   /// Frame name, to be used by TF.
   std::string frame_name_;
 
+  /// Frame names for multicamera, to be used by TF.
+  std::vector<std::string> camera_frame_ids;
+
   /// Step sizes for fillImage
   std::vector<uint32_t> img_step_;
 
@@ -131,6 +134,9 @@ public:
 
   /// Number of cameras
   uint64_t num_cameras_{1};
+
+  /// use time source from ROS node for published messages
+  bool _use_node_time;
 };
 
 GazeboRosCamera::GazeboRosCamera()
@@ -181,6 +187,11 @@ void GazeboRosCamera::Load(gazebo::sensors::SensorPtr _sensor, sdf::ElementPtr _
   // Get tf frame for output
   impl_->frame_name_ = gazebo_ros::SensorFrameID(*_sensor, *_sdf);
 
+  // Time source to use
+  impl_->_use_node_time = _sdf->Get<bool>("use_node_time", false).first;
+  RCLCPP_INFO(impl_->ros_node_->get_logger(),
+              "Using ROS node time: %d", impl_->_use_node_time);
+
   if (impl_->sensor_type_ != GazeboRosCameraPrivate::MULTICAMERA) {
     // Image publisher
     // TODO(louise) Migrate image_connect logic once SubscriberStatusCallback is ported to ROS2
@@ -209,6 +220,14 @@ void GazeboRosCamera::Load(gazebo::sensors::SensorPtr _sensor, sdf::ElementPtr _
 
   } else {
     for (uint64_t i = 0; i < impl_->num_cameras_; ++i) {
+
+      // Either the user explicitly specifies frame ids in the .sdf,
+      // or we construct it from the sensor frame id by appending the camera number
+      impl_->camera_frame_ids.push_back(
+        _sdf->Get<std::string>("frame_id_" + std::to_string(i),
+                               impl_->frame_name_ + "_" + std::to_string(i)).first);
+
+
       const std::string camera_topic =
         impl_->camera_name_ + "/" + MultiCameraPlugin::camera_[i]->Name() + "/image_raw";
       // Image publisher
@@ -386,7 +405,7 @@ void GazeboRosCamera::Load(gazebo::sensors::SensorPtr _sensor, sdf::ElementPtr _
 
     // CameraInfo
     sensor_msgs::msg::CameraInfo camera_info_msg;
-    camera_info_msg.header.frame_id = impl_->frame_name_;
+    camera_info_msg.header.frame_id = impl_->camera_frame_ids[i];
     camera_info_msg.height = height[i];
     camera_info_msg.width = width[i];
     camera_info_msg.distortion_model = "plumb_bob";
@@ -451,11 +470,16 @@ void GazeboRosCamera::Load(gazebo::sensors::SensorPtr _sensor, sdf::ElementPtr _
     camera_info_msg.r[7] = rmat(2, 1);
     camera_info_msg.r[8] = rmat(2, 2);
 
+    // The first camera always has Tx = Ty = 0. For
+    // the right (second) camera of a horizontal stereo pair, Ty = 0 and
+    // Tx = -fx' * B, where B is the baseline between the cameras.
+    double baseline = (i > 0) ? (-focal_length * hack_baseline) : 0.0;
+
     // projection matrix
     camera_info_msg.p[0] = _sdf->Get<double>("P_fx", focal_length).first;
     camera_info_msg.p[1] = 0.0;
     camera_info_msg.p[2] = _sdf->Get<double>("P_cx", cx).first;
-    camera_info_msg.p[3] = _sdf->Get<double>("Tx", -focal_length * hack_baseline).first;
+    camera_info_msg.p[3] = _sdf->Get<double>("Tx", baseline).first;
     camera_info_msg.p[4] = 0.0;
     camera_info_msg.p[5] = _sdf->Get<double>("P_fy", focal_length).first;
     camera_info_msg.p[6] = _sdf->Get<double>("P_cy", cy).first;
@@ -570,6 +594,7 @@ void GazeboRosCamera::NewFrame(
   // TODO(shivesh) Enable / disable sensor once SubscriberStatusCallback has been ported to ROS2
 
   gazebo::common::Time sensor_update_time;
+  rclcpp::Time msg_timestamp;
 
   if (impl_->sensor_type_ == GazeboRosCameraPrivate::CAMERA) {
     sensor_update_time = CameraPlugin::parentSensor->LastMeasurementTime();
@@ -579,19 +604,25 @@ void GazeboRosCamera::NewFrame(
     sensor_update_time = MultiCameraPlugin::parent_sensor_->LastMeasurementTime();
   }
 
+  if (impl_->_use_node_time) {
+    // Returns current time from the time source specified by clock_type.
+    msg_timestamp = impl_->ros_node_->get_clock()->now();
+  } else {
+    msg_timestamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(
+    sensor_update_time);
+  }
+
   // Publish camera info
   auto camera_info_msg = impl_->camera_info_manager_[_camera_num]->getCameraInfo();
-  camera_info_msg.header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(
-    sensor_update_time);
+  camera_info_msg.header.stamp = msg_timestamp;
 
   impl_->camera_info_pub_[_camera_num]->publish(camera_info_msg);
 
   std::lock_guard<std::mutex> image_lock(impl_->image_mutex_);
 
   // Publish image
-  impl_->image_msg_.header.frame_id = impl_->frame_name_;
-  impl_->image_msg_.header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(
-    sensor_update_time);
+  impl_->image_msg_.header.frame_id = impl_->camera_frame_ids[_camera_num];
+  impl_->image_msg_.header.stamp = msg_timestamp;
 
   // Copy from src to image_msg
   sensor_msgs::fillImage(
